@@ -7,22 +7,6 @@ import {
 import * as jose from 'https://deno.land/x/jose@v4.3.7/index.ts';
 import { config } from 'https://deno.land/x/dotenv@v3.2.0/mod.ts';
 
-async function writeJson(filePath: string, o: any) {
-  await Deno.writeTextFile(filePath, JSON.stringify(o));
-}
-async function getJson(filePath: string) {
-  return JSON.parse(await Deno.readTextFile(filePath));
-}
-
-await writeJson('./data.json', {
-  a: 1,
-  b: 2,
-  c: { d: 'e', f: 'g', i: [1, 2, 3, 4] },
-});
-
-const d = await getJson('./data.json');
-console.log(d);
-
 const app = new Application();
 
 const X_FORWARDED_HOST = 'x-forwarded-host';
@@ -33,6 +17,72 @@ const DENO_ORIGIN =
   Deno.env.get('DENO_ORIGIN') ?? config({ safe: true }).DENO_ORIGIN;
 const VERIFY_JWT =
   (Deno.env.get('VERIFY_JWT') ?? config({ safe: true }).VERIFY_JWT) === 'true';
+
+function getAuthToken(ctx: Context) {
+  const authHeader = ctx.request.headers.get('authorization');
+  if (!authHeader) {
+    ctx.throw(Status.Unauthorized, 'Missing authorization header');
+  }
+  const [bearer, token] = authHeader.split(' ');
+  if (bearer !== 'Bearer') {
+    ctx.throw(Status.Unauthorized, `Auth header is not 'Bearer {token}'`);
+  }
+  return token;
+}
+
+async function verifyJWT(jwt: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const secretKey = encoder.encode(JWT_SECRET);
+  try {
+    await jose.jwtVerify(jwt, secretKey);
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+  return true;
+}
+
+function sanitizeHeaders(headers: Headers): Headers {
+  const sanitizedHeaders = new Headers();
+  const headerDenyList = ['set-cookie'];
+
+  headers.forEach((value, key) => {
+    if (!headerDenyList.includes(key.toLowerCase())) {
+      sanitizedHeaders.set(key, value);
+    }
+  });
+  return sanitizedHeaders;
+}
+
+function patchedReq(req: Request): [URL, RequestInit] {
+  // Parse & patch URL (preserve path and querystring)
+  const url = req.url;
+  const denoOrigin = new URL(DENO_ORIGIN);
+  url.host = denoOrigin.host;
+  url.port = denoOrigin.port;
+  url.protocol = denoOrigin.protocol;
+  // Patch Headers
+  const xHost = url.hostname;
+
+  return [
+    url,
+    {
+      headers: {
+        ...Object.fromEntries(req.headers.entries()),
+        [X_FORWARDED_HOST]: xHost,
+      },
+      body: (req.hasBody
+        ? req.body({ type: 'stream' }).value
+        : undefined) as unknown as BodyInit,
+      method: req.method,
+    },
+  ];
+}
+
+async function relayTo(req: Request): Promise<Response> {
+  const [url, init] = patchedReq(req);
+  return await fetch(url, init);
+}
 
 app.use(async (ctx: Context, next: () => Promise<unknown>) => {
   try {
@@ -47,36 +97,42 @@ app.use(async (ctx: Context, next: () => Promise<unknown>) => {
 
 app.use(async (ctx: Context, next: () => Promise<unknown>) => {
   const { request, response } = ctx;
-  console.log(request);
-  console.log(response);
-  var url = String(request.url);
-  /*  response.body =
-    url.split('://')[1].split('.functions.omneedia.net')[0] +
-    '-' +
-    url.substring(url.lastIndexOf('/') + 1, url.length);*/
-  const resp = await fetch('https://app.fakejson.com/q', {
-    headers: {
-      accept: 'application/json',
-    },
-    method: 'POST',
-    body: {
-      token: '7p5UI7BXyvQPstfkWv1G3g',
-      data: JSON.stringify({
-        name: 'nameFirst',
-        email: 'internetEmail',
-        phone: 'phoneHome',
-        _repeat: 300,
-      }),
-    },
-  });
-  /*return new Response(resp.body, {
-    status: resp.status,
-    headers: {
-      'content-type': 'application/json',
-    },
-  });*/
-  console.log(resp);
+
+  const supportedVerbs = ['POST', 'GET', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+  if (!supportedVerbs.includes(request.method)) {
+    console.error(`${request.method} not supported`);
+    return ctx.throw(
+      Status.MethodNotAllowed,
+      `HTTP request method not supported (supported: ${supportedVerbs.join(
+        ' '
+      )})`
+    );
+  }
+
+  if (request.method !== 'OPTIONS' && VERIFY_JWT) {
+    const token = getAuthToken(ctx);
+    const isValidJWT = await verifyJWT(token);
+
+    if (!isValidJWT) {
+      return ctx.throw(Status.Unauthorized, 'Invalid JWT');
+    }
+  }
+
+  const resp = await relayTo(request);
+
+  const sanitizedHeaders = sanitizeHeaders(resp.headers);
+  if (request.method === 'GET') {
+    const contentTypeHeader = sanitizedHeaders.get('Content-Type');
+    if (contentTypeHeader?.includes('text/html')) {
+      sanitizedHeaders.set('Content-Type', 'text/plain');
+    }
+  }
+
   response.body = resp.body;
+  response.status = resp.status;
+  response.headers = sanitizedHeaders;
+  response.type = resp.type;
+
   await next();
 });
 
