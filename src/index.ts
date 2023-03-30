@@ -9,6 +9,8 @@ import { config } from 'https://deno.land/x/dotenv@v3.2.0/mod.ts';
 
 const app = new Application();
 
+Deno.env.set('MY_PASSWORD', '123456');
+
 const X_FORWARDED_HOST = 'x-forwarded-host';
 
 const JWT_SECRET =
